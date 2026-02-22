@@ -27,7 +27,6 @@ cache:
   key:
     files:
       - gradle/wrapper/gradle-wrapper.properties
-      - app/build.gradle
       - app/src/main/jni/moonlight-core-rs/Cargo.lock
     prefix: ${CI_PROJECT_ID}
   paths:
