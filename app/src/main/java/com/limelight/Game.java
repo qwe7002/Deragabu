@@ -1300,6 +1300,14 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     /**
      * Register a NetworkCallback to detect network changes (WiFi ↔ mobile)
      * and rebind the WireGuard endpoint socket so the tunnel survives handoffs.
+     *
+     * IMPORTANT: registerDefaultNetworkCallback() fires onAvailable() immediately
+     * for the current default network. We must skip this initial callback because
+     * the WireGuard tunnel was just established on this network — rebinding would
+     * replace the UDP socket (and its local port), causing the WireGuard server to
+     * send responses to the old port until a new handshake completes. This creates
+     * a window where all server→client traffic is lost, which can cause the video
+     * stream connection to fail intermittently (especially noticeable on WiFi).
      */
     private void registerWgNetworkCallback() {
         if (wgNetworkCallback != null) {
@@ -1312,9 +1320,33 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         wgNetworkCallback = new ConnectivityManager.NetworkCallback() {
+            // Track network identity to detect actual changes.
+            // The first onAvailable() is always for the current default network
+            // (fired immediately by registerDefaultNetworkCallback), which we must
+            // skip to avoid disrupting the freshly-established WireGuard tunnel.
+            private boolean initialCallbackReceived = false;
+            private Network lastKnownNetwork = null;
+
             @Override
             public void onAvailable(@NonNull Network network) {
-                Log.i(TAG, "Network available: " + network + ", rebinding WireGuard endpoint");
+                if (!initialCallbackReceived) {
+                    // First callback — tunnel is already established on this network.
+                    // Rebinding here would disrupt the connection for no benefit.
+                    initialCallbackReceived = true;
+                    lastKnownNetwork = network;
+                    Log.i(TAG, "WG NetworkCallback: initial network " + network + ", skipping rebind");
+                    return;
+                }
+
+                if (network.equals(lastKnownNetwork)) {
+                    // Same network as before — no rebind needed.
+                    Log.d(TAG, "WG NetworkCallback: same network " + network + ", skipping rebind");
+                    return;
+                }
+
+                Log.i(TAG, "WG NetworkCallback: network changed " + lastKnownNetwork + " -> " + network + ", rebinding WireGuard endpoint");
+                lastKnownNetwork = network;
+
                 if (MoonBridge.wgIsTunnelActive()) {
                     boolean ok = MoonBridge.wgRebindEndpoint();
                     Log.i(TAG, "WireGuard endpoint rebind result: " + ok);
@@ -1323,8 +1355,12 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
             @Override
             public void onLost(@NonNull Network network) {
-                Log.i(TAG, "Network lost: " + network);
-                // Nothing to do here; onAvailable will fire for the new network.
+                Log.i(TAG, "WG NetworkCallback: network lost: " + network);
+                // Clear last known network so the next onAvailable triggers a rebind
+                // even if Android re-connects to the same underlying network.
+                if (network.equals(lastKnownNetwork)) {
+                    lastKnownNetwork = null;
+                }
             }
         };
 

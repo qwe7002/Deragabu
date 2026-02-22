@@ -360,6 +360,27 @@ impl WireGuardTunnel {
                     if running.load(Ordering::Relaxed) {
                         warn!("WireGuard endpoint recv error: {}", e);
                     }
+                    // Check for socket replacement on unexpected errors too
+                    // (e.g., ENETUNREACH / EHOSTUNREACH after network change).
+                    // Without this, the receiver stays on the dead socket clone
+                    // and never picks up the new socket from wg_rebind_endpoint().
+                    let st = state.lock();
+                    if st.socket_generation != current_socket_gen {
+                        info!("WG receiver: socket replaced on error (gen {} -> {}), re-cloning",
+                              current_socket_gen, st.socket_generation);
+                        match st.endpoint_socket.try_clone() {
+                            Ok(new_sock) => {
+                                let new_gen = st.socket_generation;
+                                drop(st);
+                                new_sock.set_read_timeout(Some(Duration::from_millis(10))).ok();
+                                recv_socket = new_sock;
+                                current_socket_gen = new_gen;
+                            }
+                            Err(e2) => {
+                                warn!("WG receiver: failed to re-clone socket on error: {}", e2);
+                            }
+                        }
+                    }
                     continue;
                 }
             };

@@ -1,0 +1,145 @@
+# GitLab CI/CD Configuration for Moonlight Android
+
+stages:
+  - build
+
+# ------------------------------------------------------------------------------
+# Global Configuration
+# ------------------------------------------------------------------------------
+default:
+  image: alvrme/alpine-android:android-36-jdk21
+  timeout: 45m
+  interruptible: true
+
+variables:
+  GIT_DEPTH: 0
+  # Gradle settings
+  GRADLE_USER_HOME: "${CI_PROJECT_DIR}/.gradle"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+  # NDK version must match app/build.gradle ndkVersion
+  NDK_VERSION: "29.0.14206865"
+  # Rust toolchain
+  RUST_TOOLCHAIN: "stable"
+  RUST_TARGET: "aarch64-linux-android"
+
+# Cache configuration for faster builds
+cache:
+  key:
+    files:
+      - gradle/wrapper/gradle-wrapper.properties
+      - app/build.gradle
+      - app/src/main/jni/moonlight-core-rs/Cargo.lock
+    prefix: ${CI_PROJECT_ID}
+  paths:
+    - .gradle/caches/
+    - .gradle/wrapper/
+    - app/src/main/jni/moonlight-core-rs/target/
+  policy: pull-push
+
+# ------------------------------------------------------------------------------
+# Job Templates
+# ------------------------------------------------------------------------------
+.setup_environment: &setup_environment
+  before_script:
+    - |
+      set -euo pipefail
+      echo "==> Installing system dependencies..."
+      apk --update --no-cache add \
+        git bash curl wget ca-certificates \
+        build-base cmake ninja python3 \
+        openssl-dev linux-headers
+    - |
+      echo "==> Setting up Android NDK..."
+      if [ ! -d "${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" ]; then
+        echo "Installing NDK ${NDK_VERSION}..."
+        yes | sdkmanager --install "ndk;${NDK_VERSION}" || true
+      fi
+      export ANDROID_NDK_HOME="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+      export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+      echo "NDK installed at: ${ANDROID_NDK_HOME}"
+    - |
+      echo "==> Installing Rust toolchain..."
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain ${RUST_TOOLCHAIN} \
+        --profile minimal
+      source "${HOME}/.cargo/env"
+      rustup target add ${RUST_TARGET}
+      echo "Rust version: $(rustc --version)"
+      echo "Cargo version: $(cargo --version)"
+    - |
+      echo "==> Configuring git..."
+      git config --global user.email "ci-bot@qwe7002.dev"
+      git config --global user.name "GitLab CI Bot"
+    - |
+      echo "==> Setting up Gradle..."
+      mkdir -p "${GRADLE_USER_HOME}"
+      cat >> "${GRADLE_USER_HOME}/gradle.properties" << EOF
+      org.gradle.jvmargs=-Xmx3072m -XX:+HeapDumpOnOutOfMemoryError
+      org.gradle.parallel=true
+      org.gradle.caching=true
+      org.gradle.configureondemand=true
+      android.ndkVersion=${NDK_VERSION}
+      EOF
+      chmod +x ./gradlew
+    - |
+      echo "==> Generating version info..."
+      export VERSION_CODE="${CI_PIPELINE_ID}"
+      export VERSION_NAME="$(date +%Y%m%d%H%M)-${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}"
+      echo "Version Code: ${VERSION_CODE}"
+      echo "Version Name: ${VERSION_NAME}"
+
+# ------------------------------------------------------------------------------
+# Release Build
+# ------------------------------------------------------------------------------
+build_release:
+  stage: build
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+  <<: *setup_environment
+  script:
+    - |
+      source "${HOME}/.cargo/env"
+      echo "==> Building Release APK..."
+      ./gradlew clean assembleRelease --stacktrace --no-daemon
+    - |
+      echo "==> Build artifacts:"
+      find app/build/outputs/apk/release -name '*.apk' -exec ls -lh {} \;
+  artifacts:
+    name: "moonlight-android-release-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - app/build/outputs/apk/release/*.apk
+    expire_in: 30 days
+    when: on_success
+
+# ------------------------------------------------------------------------------
+# Debug Build (manual trigger)
+# ------------------------------------------------------------------------------
+build_debug:
+  stage: build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+    - if: $CI_COMMIT_BRANCH != "master"
+      when: manual
+  <<: *setup_environment
+  script:
+    - |
+      source "${HOME}/.cargo/env"
+      echo "==> Building Debug APK..."
+      ./gradlew assembleDebug --stacktrace --no-daemon
+    - |
+      echo "==> Build artifacts:"
+      find app/build/outputs/apk/debug -name '*.apk' -exec ls -lh {} \;
+  artifacts:
+    name: "moonlight-android-debug-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - app/build/outputs/apk/debug/*.apk
+    expire_in: 3 days
+    when: on_success
+  cache:
+    policy: pull
